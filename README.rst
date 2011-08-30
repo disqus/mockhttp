@@ -1,6 +1,16 @@
+mockhttp
+========
+
 **Work in progress** library to mock http requests and return predefined fixtures for their results.
 
-Will support at least urllib, urllib2, and httplib (in the basic forms).
+Whats Done
+----------
+
+* basic urllib support (only tested with urlopen, non SSL)
+* basic httplib support (only with non SSL)
+
+Usage
+-----
 
 ::
 
@@ -15,3 +25,10 @@ Will support at least urllib, urllib2, and httplib (in the basic forms).
         
         r = urllib.urlopen('http://foo.bar.com', 'a=b')
         print r.read()
+
+TODO
+----
+
+* coverage :)
+* https suport
+* urllib2
