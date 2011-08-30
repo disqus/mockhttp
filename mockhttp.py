@@ -1,21 +1,28 @@
 import hashlib
+import httplib
 import mock
-from collections import defaultdict
 from functools import wraps
+from StringIO import StringIO
 from urlparse import urlparse, parse_qs
 
 __all__ = ('patch', 'response')
 
 class MockResponse(object):
-    def __init__(self, fixture=None, status=200, headers=()):
+    def __init__(self, fixture=None, status=200, headers=(), version='HTTP/1.1'):
         self.fixture = fixture
         self.status = status
         self.headers = headers
+        self.version = version
+        if self.fixture:
+            self.fp = open(self.fixture, 'rb')
+        else:
+            self.fp = StringIO()
 
     def read(self):
-        if not self.fixture:
-            return ''
-        return open(self.fixture, 'rb').read()
+        return self.fp.read()
+
+    def readline(self):
+        return self.fp.readline()
 
 response = MockResponse
 
@@ -28,6 +35,10 @@ class MockRequest(object):
     def __init__(self, url=None, method=None, params={}):
         if method:
             method = method.upper()
+
+        # Ensure we end with a valid path
+        if url and url.count('/') == 2:
+            url += '/'
 
         self.url = url
         self.method = method
@@ -44,8 +55,16 @@ def _make_request(*args):
 def _make_signature(url=None, method=None, params={}):
     if not url:
         return ()
+
+    # Ensure we end with a valid path
+    if url.count('/') == 2:
+        url += '/'
+
     if not method:
         return (url,)
+    
+    method = method.upper()
+    
     if not params:
         return (url, method)
 
@@ -63,50 +82,96 @@ def _tup_pref_matches(t1, t2):
     for i, x in enumerate(t1):
         try:
             if t1[i] == t2[i]:
-                i += 1
+                n += 1
             else:
                 break
         except IndexError:
             break
     return n
 
-class MockHandler(object):
-    def __init__(self, mock_obj, fixtures):
-        self.mock_obj = mock_obj
-        self.fixtures = fixtures
+def _get_response_fixture(fixtures, url, method, params):
+    this_signature = _make_signature(url, method, params)
+    best_num = 0
+    best_resp = None
+    
+    for request, response in fixtures:
+        matches = _tup_pref_matches(request.sig, this_signature)
+        if not matches or best_num >= matches:
+            continue
+        best_num = matches
+        best_resp = response
+    if best_resp:
+        return best_resp
+    return MockResponse(status=404)
 
-    def _get_response_fixture(self, url, method, params):
-        this_signature = _make_signature(url, method, params)
-        best = tuple()
-        for request, response in self.fixtures:
-            matches = _tup_pref_matches(request.sig, this_signature)
-            if not matches or len(best) >= matches:
-                continue
-            best = signature
-        if best:
-            return best
-        return MockResponse(status=404)
+def make_response_class(response, parent):
+    class new(parent):
+        def __init__(self, sock, debuglevel=0, strict=0, method=None, buffering=False):
+            self.debuglevel = debuglevel
+            self.strict = strict
+            self._method = method
 
-class MockUrlOpen(MockHandler):
-    def read(self):
-        kwargs = defaultdict(lambda:None)
-        named_args = ['url', 'data', 'proxies']
-        call_args = self.mock_obj.call_args
-        for i, x in enumerate(call_args[0]):
-            kwargs[named_args[i]] = x
-        kwargs.update(self.mock_obj.call_args[1])
+            self.msg = None
 
-        if kwargs['data']:
-            method = 'POST'
-        else:
-            method = 'GET'
+            # from the Status-Line of the response
+            self.version = httplib._UNKNOWN # HTTP-Version
+            self.status = httplib._UNKNOWN  # Status-Code
+            self.reason = httplib._UNKNOWN  # Reason-Phrase
+
+            self.chunked = httplib._UNKNOWN         # is "chunked" being used?
+            self.chunk_left = httplib._UNKNOWN      # bytes left to read in current chunk
+            self.length = httplib._UNKNOWN          # number of bytes left in response
+            self.will_close = httplib._UNKNOWN      # conn will close at end of response
+            self.fp = None
+
+        def begin(self):
+            self.status = response.status
+            if response.version == 'HTTP/1.0':
+                self.version = 10
+            elif response.version.startswith('HTTP/1.'):
+                self.version = 11   # use HTTP/1.1 code for HTTP/1.x where x>=1
+            elif response.version == 'HTTP/0.9':
+                self.version = 9
+            else:
+                raise httplib.UnknownProtocol(response.version)
+            
+            self.will_close = 1
+            self.fp = response
+            
+        def read(self):
+            return response.read()
         
-        if kwargs['data']:
-            params = parse_qs(kwargs['data'])
+    new.__name__ = parent.__name__
+    return new
+
+def make_send_wrapper(fixtures):
+    """
+    This is for urllib support, and is ugly as shit.
+    """
+    s = []
+    def send(self, data):
+        last = None
+        split_data = data.split('\r\n')
+        for lineno, line in enumerate(split_data):
+            if lineno == 0:
+                path, version = line.split(' ')[1:]
+            elif not last:
+                break
+            lineno += 1
+            last = line
+
+        url = 'http://%s' % self.host
+        if self.port != 80:
+            url += ':%s' % self.port
+        url += path
+        body = '\n'.join(split_data[lineno:])
+
+        if body:
+            params = parse_qs(body)
         else:
             params = {}
-        
-        parsed = urlparse(kwargs['url'])
+
+        parsed = urlparse(url)
         if parsed.query:
             for k, v in parse_qs(parsed.query).iteritems():
                 if k not in params:
@@ -114,16 +179,50 @@ class MockUrlOpen(MockHandler):
                 else:
                     params[k].extend(v)
 
-        match = self._get_response_fixture(kwargs['url'], method, params)
+        response = _get_response_fixture(fixtures, url, self._method, params)
 
-        if match.fixture:
-            body = open(match.fixture, 'rb').read()
+        self.__state = httplib._CS_REQ_SENT
+        
+        if not s:
+            s.append(self.response_class)
+
+        self.response_class = make_response_class(response, s[0])
+    return send
+
+def make_send_request_wrapper(fixtures):
+    s = []
+    def _send_request(self, method, path, body=None, headers={}):
+        global response_class
+        
+        """Send a complete request to the server."""
+        if body:
+            params = parse_qs(body)
         else:
-            body = ''
-        return body
+            params = {}
 
-class MockHttpConnection(MockHandler):
-    pass
+        parsed = urlparse(path)
+        if parsed.query:
+            for k, v in parse_qs(parsed.query).iteritems():
+                if k not in params:
+                    params[k] = v
+                else:
+                    params[k].extend(v)
+
+        url = 'http://%s' % self.host
+        if self.port != 80:
+            url += ':%s' % self.port
+        url += path
+
+        response = _get_response_fixture(fixtures, url, method, params)
+
+        self._method = method
+        setattr(self, '_%s__state' % self.__class__.__name__, httplib._CS_REQ_SENT)
+        
+        if not s:
+            s.append(self.response_class)
+
+        self.response_class = make_response_class(response, s[0])
+    return _send_request
 
 class PatchContextManager(object):
     """
@@ -137,9 +236,9 @@ class PatchContextManager(object):
         )):
     """
     def __init__(self, libname, fixtures=()):
-        assert libname in ('urllib', 'urllib2', 'httplib.HTTPConnection', 'httplib.HTTPSConnection')
+        assert libname in ('urllib', 'urllib2', 'httplib')
         self.libname = libname
-        self.fixtures = [(_make_request(k), _make_response(v)) for k, v in fixtures]
+        self.fixtures = [(_make_request(*k), _make_response(v)) for k, v in fixtures]
         self._cm = None
 
     def __call__(self, func):
@@ -150,18 +249,15 @@ class PatchContextManager(object):
         return inner
 
     def __enter__(self):
-        if self.libname in ('urllib', 'urllib2'):
-            libpath = '%s.urlopen' % self.libname
-            mock_cls = MockUrlOpen
-        else:
-            libpath = self.libname
-            mock_cls = MockHttpConnection
-        
-        self._patcher = mock.patch(libpath)
-        mock_obj = self._patcher.start()
-        mock_obj.return_value = mock_cls(mock_obj, self.fixtures)
+        self._patchers = [
+            mock.patch.object(httplib.HTTPConnection, 'send', make_send_wrapper(self.fixtures)),
+            mock.patch.object(httplib.HTTPConnection, '_send_request', make_send_request_wrapper(self.fixtures)),
+        ]
+        for patcher in self._patchers:
+            patcher.start()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._patcher.stop()
+        for patcher in self._patchers:
+            patcher.stop()
 
 patch = PatchContextManager
